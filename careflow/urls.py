@@ -1,30 +1,25 @@
-"""
-URL configuration for careflow project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/6.1/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
 
 from django.contrib import admin
-from django.urls import path,include
+from django.urls import include, path
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.http import JsonResponse
+from web.views import current_user, patient_registration, session_login, session_logout, pending_clinicians, review_clinician_registration
 
 
-from django.contrib import admin
-from django.urls import path, include
+@ensure_csrf_cookie
+def csrf(request):
+    return JsonResponse({"detail": "CSRF cookie set"})
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/csrf/", csrf, name="csrf"),
+    path("api/auth/me/", current_user, name="current-user"),
+    path("api/auth/register/", patient_registration, name="patient-registration"),
+    path("api/auth/login/", session_login, name="session-login"),
+    path("api/auth/logout/", session_logout, name="session-logout"),
+    path("api/admin/clinician-requests/", pending_clinicians, name="pending-clinicians"),
+    path("api/admin/clinician-requests/<int:registration_id>/review/", review_clinician_registration, name="review-clinician-registration"),
     path("api/", include("web.urls")),
     path("api-auth/", include("rest_framework.urls")),
 ]
-
