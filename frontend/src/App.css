@@ -1071,11 +1071,24 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .suggestion-grid p,.suggestion-source p { margin: 0; color: #d0dce2; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
 .suggestion-source { margin-top: 10px; }
 .suggestion-source strong { display: block; margin-bottom: 6px; color: #a9bdc7; font-size: 10px; }
-.clinician-review-form { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px 12px; margin-top: 14px; padding-top: 13px; border-top: 1px solid #293a45; }
-.clinician-review-form label { margin: 0; }
-.clinician-review-form label:first-child,.clinician-review-form>button { grid-column: 1 / -1; }
-.clinician-review-form .two-columns { grid-column: 1 / -1; }
-.clinician-review-form textarea { min-height: 56px; }
+.clinician-review-form { display: grid; grid-template-columns: minmax(0,1fr); gap: 14px; min-width: 0; margin-top: 14px; padding-top: 14px; border-top: 1px solid #293a45; }
+.review-group { display: grid; gap: 10px; min-width: 0; padding: 14px; background: #111b24; border: 1px solid #293a45; border-radius: 9px; }
+.review-group h4 { margin: 0; color: #e0ebf0; font-size: 12px; font-weight: 700; line-height: 1.4; }
+.clinician-review-form label { display: flex; flex-direction: column; align-items: stretch; gap: 8px; min-width: 0; width: 100%; margin: 0; color: #b6c6ce; font-size: 11px; font-weight: 650; line-height: 1.4; }
+.review-outcome-field { max-width: 340px; }
+.review-outcome-field select { box-sizing: border-box; width: min(100%, 300px); min-width: min(220px, 100%); }
+.review-notes-grid,.review-care-fields { display: grid; grid-template-columns: minmax(0,1fr); gap: 12px; min-width: 0; }
+.review-notes-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.review-private-note { margin-top: -4px; color: #8fa4ae; font-size: 10px; font-weight: 400; line-height: 1.4; }
+.clinician-review-form textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; min-height: 112px; padding: 11px 12px; color: #e4edf1; background: #0b141c; border: 1px solid #3a4d58; border-radius: 7px; line-height: 1.5; resize: vertical; }
+.clinician-review-form .review-care-fields textarea { min-height: 112px; }
+.clinician-review-form textarea[name="patient_request"],.clinician-review-form textarea[name="escalation_reason"] { min-height: 88px; }
+.clinician-review-form textarea::placeholder { color: #8295a1; opacity: 1; }
+.clinician-review-form textarea:focus-visible,.clinician-review-form select:focus-visible { border-color: #46d8ce; outline: 2px solid #46d8ce; outline-offset: 2px; box-shadow: 0 0 0 3px #46d8ce22; }
+.review-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; min-width: 0; padding-top: 1px; }
+.review-actions button { min-height: 38px; padding: 8px 13px; font-size: 11px; }
+.patient-request { display: grid; gap: 5px; padding: 11px 12px; background: #101922; border: 1px solid #36505c; border-radius: 7px; }
+.patient-request span { color: #dce6eb; white-space: pre-wrap; }
 .patient-review-section>p { display: grid; grid-template-columns: minmax(130px,175px) 1fr; gap: 14px; margin: 11px 0; color: #dce6eb; font-size: 12px; line-height: 1.55; }
 .patient-review-section>p strong { color: #a9bdc7; font-size: 11px; }
 .review-error { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #d9a1a7; font-size: 12px; }
@@ -1091,8 +1104,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .case-detail-controls { justify-content: flex-start; max-width: none; }
   .compact-status-control { align-items: flex-start; flex-direction: column; }
   .compact-status-control select { width: 100%; }
-  .suggestion-grid,.clinician-review-form,.original-answers dl { grid-template-columns: 1fr; }
-  .clinician-review-form label:first-child,.clinician-review-form>button,.clinician-review-form .two-columns { grid-column: auto; }
+  .suggestion-grid,.clinician-review-form,.review-notes-grid,.original-answers dl { grid-template-columns: 1fr; }
+  .review-group { padding: 12px; }
+  .review-actions { justify-content: flex-start; }
   .activity-timeline li { grid-template-columns: 1fr; gap: 3px; }
   .patient-review-section>p { grid-template-columns: 1fr; gap: 3px; }
 }

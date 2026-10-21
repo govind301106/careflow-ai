@@ -9,7 +9,7 @@ from django.db import DatabaseError
 from django.db.models.query import QuerySet
 from rest_framework import status
 from rest_framework.test import APITestCase
-from .models import Case, PatientIntake, ConsentRecord, ClinicianReview, AIResult
+from .models import Case, PatientIntake, ConsentRecord, ClinicianReview, CaseActivity, AIResult
 from .models import ClinicianRegistration
 
 User = get_user_model()
@@ -144,9 +144,13 @@ class CareFlowAPITests(APITestCase):
         status_response = self.client.patch(
             f"/api/cases/{case.pk}/update_status/", {"status": "ESCALATED"}, format="json"
         )
-        self.assertEqual(status_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(status_response.status_code, status.HTTP_400_BAD_REQUEST)
+        escalation = self.client.post(f"/api/cases/{case.pk}/add_review/", {
+            "workflow_action": "escalate", "decision": "IN_REVIEW", "escalation_reason": "Needs specialist handoff."}, format="json")
+        self.assertEqual(escalation.status_code, status.HTTP_201_CREATED)
         case.refresh_from_db()
         self.assertEqual(case.status, "ESCALATED")
+        self.assertIsNone(case.assigned_clinician_id)
 
     def test_patient_review_is_pending_until_finalized_and_excludes_internal_notes(self):
         clinician_group, _ = Group.objects.get_or_create(name="Clinician")
@@ -156,7 +160,7 @@ class CareFlowAPITests(APITestCase):
         patient_url = f"/api/cases/{case.pk}/patient-review/"
 
         self.client.force_authenticate(user=self.patient)
-        self.assertEqual(self.client.get(patient_url).json(), {"status": "pending", "review": None})
+        self.assertEqual(self.client.get(patient_url).json(), {"status": "in_progress", "request": None, "review": None})
 
         self.client.force_authenticate(user=clinician)
         draft = self.client.post(f"/api/cases/{case.pk}/add_review/", {
@@ -164,11 +168,11 @@ class CareFlowAPITests(APITestCase):
         }, format="json")
         self.assertEqual(draft.status_code, status.HTTP_201_CREATED)
         self.client.force_authenticate(user=self.patient)
-        self.assertEqual(self.client.get(patient_url).json(), {"status": "in_review", "review": None})
+        self.assertEqual(self.client.get(patient_url).json(), {"status": "in_progress", "request": None, "review": None})
 
         self.client.force_authenticate(user=clinician)
         finalized = self.client.post(f"/api/cases/{case.pk}/add_review/", {
-            "decision": "NEEDS_INFORMATION", "reviewer_comments": "internal notes",
+            "decision": "NEEDS_INFORMATION", "workflow_action": "request_information", "patient_request": "Please provide the test result.", "reviewer_comments": "internal notes",
             "edited_note": "private edited note", "patient_comments": "Please provide the test result.",
             "follow_up_instructions": "Upload the result when available.", "referral_details": "Clinic referral pending.",
         }, format="json")
@@ -176,8 +180,21 @@ class CareFlowAPITests(APITestCase):
         self.client.force_authenticate(user=self.patient)
         response = self.client.get(patient_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["status"], "in_progress")
+        self.assertEqual(response.data["request"], "Please provide the test result.")
+        self.assertIsNone(response.data["review"])
+        self.client.force_authenticate(user=clinician)
+        self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "save_draft", "decision": "IN_REVIEW"}, format="json")
+        finalized = self.client.post(f"/api/cases/{case.pk}/add_review/", {
+            "workflow_action": "finalize", "decision": "APPROVED", "patient_comments": "Review complete.",
+            "reviewer_comments": "private final note", "follow_up_instructions": "Upload the result when available.",
+            "referral_details": "Clinic referral pending.",
+        }, format="json")
+        self.assertEqual(finalized.status_code, status.HTTP_201_CREATED)
+        self.client.force_authenticate(user=self.patient)
+        response = self.client.get(patient_url)
         self.assertEqual(response.data["status"], "completed")
-        self.assertEqual(response.data["review"]["patient_comments"], "Please provide the test result.")
+        self.assertEqual(response.data["review"]["patient_comments"], "Review complete.")
         self.assertEqual(response.data["review"]["follow_up_instructions"], "Upload the result when available.")
         self.assertEqual(response.data["review"]["referral_details"], "Clinic referral pending.")
         self.assertIn("created_at", response.data["review"])
@@ -188,7 +205,7 @@ class CareFlowAPITests(APITestCase):
         case = Case.objects.create(owner=self.patient, patient_name="API Patient", description="Cough", status=Case.Status.IN_REVIEW)
         self.client.force_authenticate(user=self.patient)
         response = self.client.get(f"/api/cases/{case.pk}/patient-review/")
-        self.assertEqual(response.data, {"status": "pending", "review": None})
+        self.assertEqual(response.data, {"status": "in_progress", "request": None, "review": None})
 
     def test_patient_ai_suggestions_states_are_independent_and_unconfigured_is_explicit(self):
         case = Case.objects.create(owner=self.patient, patient_name="AI state", description="Headache", status=Case.Status.IN_REVIEW)
@@ -198,7 +215,7 @@ class CareFlowAPITests(APITestCase):
             self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-ai-suggestions/").data, {"status": "not_started", "result": None})
         AIResult.objects.create(case=case, status=AIResult.ProcessingStatus.PENDING)
         self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-ai-suggestions/").data, {"status": "in_progress", "result": None})
-        self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-review/").data, {"status": "pending", "review": None})
+        self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-review/").data, {"status": "in_progress", "request": None, "review": None})
         AIResult.objects.filter(case=case).delete()
         AIResult.objects.create(case=case, status=AIResult.ProcessingStatus.FAILED, error_code="private_failure")
         failed = self.client.get(f"/api/cases/{case.pk}/patient-ai-suggestions/")
@@ -252,9 +269,9 @@ class CareFlowAPITests(APITestCase):
         self.client.post(f"/api/cases/{case.pk}/add_review/", {"decision": "IN_REVIEW"}, format="json")
         self.client.force_authenticate(user=self.patient)
         self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-ai-suggestions/").data["status"], "completed")
-        self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-review/").data["status"], "in_review")
+        self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-review/").data["status"], "in_progress")
         self.client.force_authenticate(user=clinician)
-        finalized = self.client.post(f"/api/cases/{case.pk}/add_review/", {"decision": "APPROVED", "patient_comments": "Please book a follow-up."}, format="json")
+        finalized = self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "finalize", "decision": "APPROVED", "patient_comments": "Please book a follow-up."}, format="json")
         self.assertEqual(finalized.status_code, status.HTTP_201_CREATED)
         self.client.force_authenticate(user=self.patient)
         self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-review/").data["status"], "completed")
@@ -267,14 +284,14 @@ class CareFlowAPITests(APITestCase):
         clinician.groups.add(clinician_group)
         case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Review only", description="Question")
         self.client.force_authenticate(user=clinician)
-        response = self.client.post(f"/api/cases/{case.pk}/add_review/", {"decision": "NEEDS_INFORMATION", "patient_comments": "Please add the missing detail."}, format="json")
+        response = self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "request_information", "decision": "NEEDS_INFORMATION", "patient_request": "Please add the missing detail."}, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.client.force_authenticate(user=self.patient)
         with patch.dict("os.environ", {"AI_PIPELINE_URL": ""}):
             self.assertEqual(self.client.get(f"/api/cases/{case.pk}/patient-ai-suggestions/").data["status"], "not_configured")
         review = self.client.get(f"/api/cases/{case.pk}/patient-review/")
-        self.assertEqual(review.data["status"], "completed")
-        self.assertEqual(review.data["review"]["decision"], "NEEDS_INFORMATION")
+        self.assertEqual(review.data["status"], "in_progress")
+        self.assertEqual(review.data["request"], "Please add the missing detail.")
 
     def test_patient_ai_database_failure_is_logged_and_sanitized(self):
         case = Case.objects.create(owner=self.patient, patient_name="AI error", description="Question")
@@ -308,14 +325,14 @@ class CareFlowAPITests(APITestCase):
         pending_case = Case.objects.create(owner=self.patient, patient_name="Two", description="Case two")
         self.client.force_authenticate(user=clinician)
         saved = self.client.post(f"/api/cases/{completed_case.pk}/add_review/", {
-            "decision": "NEEDS_INFORMATION", "patient_comments": "Case one review only.",
+            "workflow_action": "request_information", "decision": "NEEDS_INFORMATION", "patient_request": "Case one request only.",
         }, format="json")
         self.assertEqual(saved.status_code, status.HTTP_201_CREATED)
         self.client.force_authenticate(user=self.patient)
         first_review = self.client.get(f"/api/cases/{completed_case.pk}/patient-review/")
         second_review = self.client.get(f"/api/cases/{pending_case.pk}/patient-review/")
-        self.assertEqual(first_review.data["review"]["patient_comments"], "Case one review only.")
-        self.assertEqual(second_review.data, {"status": "pending", "review": None})
+        self.assertEqual(first_review.data["request"], "Case one request only.")
+        self.assertEqual(second_review.data, {"status": "in_progress", "request": None, "review": None})
 
     def test_patient_cannot_read_another_patients_review(self):
         case = Case.objects.create(owner=self.patient, patient_name="API Patient", description="Cough")
@@ -355,8 +372,176 @@ class CareFlowAPITests(APITestCase):
         clinician.groups.add(clinician_group)
         case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="API Patient", description="Cough")
         self.client.force_authenticate(user=clinician)
-        response = self.client.post(f"/api/cases/{case.pk}/add_review/", {"decision": "NEEDS_INFORMATION"}, format="json")
+        response = self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "finalize", "decision": "APPROVED"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_information_request_and_escalation_require_payload_and_remain_unfinished(self):
+        clinician_group, _ = Group.objects.get_or_create(name="Clinician")
+        clinician = User.objects.create_user(username="workflow_clinician", password="test-password-123")
+        clinician.groups.add(clinician_group)
+        case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Workflow", description="Question")
+        self.client.force_authenticate(user=clinician)
+        missing_request = self.client.post(f"/api/cases/{case.pk}/add_review/", {
+            "workflow_action": "request_information", "decision": "IN_REVIEW",
+        }, format="json")
+        self.assertEqual(missing_request.status_code, status.HTTP_400_BAD_REQUEST)
+        missing_reason = self.client.post(f"/api/cases/{case.pk}/add_review/", {
+            "workflow_action": "escalate", "decision": "IN_REVIEW",
+        }, format="json")
+        self.assertEqual(missing_reason.status_code, status.HTTP_400_BAD_REQUEST)
+        escalated = self.client.post(f"/api/cases/{case.pk}/add_review/", {
+            "workflow_action": "escalate", "decision": "IN_REVIEW", "escalation_reason": "Needs specialist handoff.",
+        }, format="json")
+        self.assertEqual(escalated.status_code, status.HTTP_201_CREATED)
+        case.refresh_from_db()
+        self.assertEqual(case.status, Case.Status.ESCALATED)
+        self.assertIsNone(case.assigned_clinician_id)
+        self.assertFalse(escalated.data["is_finalized"])
+        self.assertEqual(escalated.data["escalation_reason"], "Needs specialist handoff.")
+        handoff_clinician = User.objects.create_user(username="handoff_clinician", password="test-password-123")
+        handoff_clinician.groups.add(clinician_group)
+        assignment = self.client.patch(f"/api/cases/{case.pk}/assign/", {"clinician_id": handoff_clinician.pk}, format="json")
+        self.assertEqual(assignment.status_code, status.HTTP_200_OK)
+        case.refresh_from_db()
+        self.assertEqual(case.assigned_clinician_id, handoff_clinician.pk)
+        self.client.force_authenticate(user=self.patient)
+        patient_view = self.client.get(f"/api/cases/{case.pk}/patient-review/")
+        self.assertEqual(patient_view.data, {"status": "in_progress", "request": None, "review": None})
+
+    def test_case_workflow_requires_valid_handoff_and_finalization_actions(self):
+        clinician_group, _ = Group.objects.get_or_create(name="Clinician")
+        clinician = User.objects.create_user(username="transition_clinician", password="test-password-123")
+        clinician.groups.add(clinician_group)
+        case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Transitions", description="Question")
+        self.client.force_authenticate(user=clinician)
+        self.assertEqual(self.client.patch(f"/api/cases/{case.pk}/update_status/", {"status": "NEEDS_INFORMATION"}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.client.patch(f"/api/cases/{case.pk}/update_status/", {"status": "APPROVED"}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+        draft = self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "save_draft", "decision": "IN_REVIEW", "reviewer_comments": "private"}, format="json")
+        self.assertEqual(draft.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "finalize", "decision": "APPROVED"}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+        finalized = self.client.post(f"/api/cases/{case.pk}/add_review/", {"workflow_action": "finalize", "decision": "APPROVED", "patient_comments": "Reviewed."}, format="json")
+        self.assertEqual(finalized.status_code, status.HTTP_201_CREATED)
+        case.refresh_from_db()
+        self.assertEqual(case.status, Case.Status.APPROVED)
+        self.assertTrue(finalized.data["is_finalized"])
+
+    def test_clinician_review_workflow_persists_state_activity_and_patient_visibility(self):
+        clinician_group, _ = Group.objects.get_or_create(name="Clinician")
+        clinician = User.objects.create_user(username="end_to_end_clinician", password="test-password-123")
+        clinician.groups.add(clinician_group)
+        case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Workflow", description="Review this case")
+        url = f"/api/cases/{case.pk}/add_review/"
+        patient_url = f"/api/cases/{case.pk}/patient-review/"
+
+        self.client.force_authenticate(user=clinician)
+        draft_response = self.client.post(url, {
+            "workflow_action": "save_draft", "decision": "IN_REVIEW",
+            "reviewer_comments": "Private draft note", "patient_comments": "Draft patient text",
+            "patient_request": "Draft question", "escalation_reason": "Draft handoff",
+        }, format="json")
+        self.assertEqual(draft_response.status_code, status.HTTP_201_CREATED)
+        review = ClinicianReview.objects.get(case=case)
+        case.refresh_from_db()
+        self.assertFalse(review.is_finalized)
+        self.assertEqual(review.reviewer_comments, "Private draft note")
+        self.assertEqual(review.patient_request, "Draft question")
+        self.assertEqual(case.status, Case.Status.IN_REVIEW)
+        self.assertEqual(draft_response.data["case_state"]["status"], Case.Status.IN_REVIEW)
+        self.assertEqual(CaseActivity.objects.filter(case=case, action="REVIEW_DRAFT_SAVED").count(), 1)
+
+        self.client.force_authenticate(user=self.patient)
+        draft_view = self.client.get(patient_url)
+        self.assertEqual(draft_view.data, {"status": "in_progress", "request": None, "review": None})
+
+        self.client.force_authenticate(user=clinician)
+        requested = self.client.post(url, {
+            "workflow_action": "request_information", "decision": "IN_REVIEW",
+            "reviewer_comments": "Private draft note", "patient_request": "What date did the symptom begin?",
+            "escalation_reason": "Keep the handoff note for later.",
+        }, format="json")
+        self.assertEqual(requested.status_code, status.HTTP_201_CREATED)
+        case.refresh_from_db()
+        review.refresh_from_db()
+        self.assertEqual(case.status, Case.Status.NEEDS_INFORMATION)
+        self.assertFalse(review.is_finalized)
+        self.assertEqual(review.patient_request, "What date did the symptom begin?")
+        self.assertEqual(requested.data["case_state"]["status"], Case.Status.NEEDS_INFORMATION)
+        self.assertTrue(CaseActivity.objects.filter(case=case, action="INFORMATION_REQUESTED", new_status=Case.Status.NEEDS_INFORMATION).exists())
+        self.client.force_authenticate(user=self.patient)
+        patient_request = self.client.get(patient_url)
+        self.assertEqual(patient_request.data["request"], "What date did the symptom begin?")
+        self.assertIsNone(patient_request.data["review"])
+        self.assertNotIn("reviewer_comments", patient_request.data)
+
+        self.client.force_authenticate(user=clinician)
+        escalated = self.client.post(url, {
+            "workflow_action": "escalate", "decision": "IN_REVIEW",
+            "reviewer_comments": "Private draft note", "patient_request": "What date did the symptom begin?",
+            "escalation_reason": "Needs specialist handoff.",
+        }, format="json")
+        self.assertEqual(escalated.status_code, status.HTTP_201_CREATED)
+        case.refresh_from_db()
+        review.refresh_from_db()
+        self.assertEqual(case.status, Case.Status.ESCALATED)
+        self.assertIsNone(case.assigned_clinician_id)
+        self.assertFalse(review.is_finalized)
+        self.assertEqual(review.escalation_reason, "Needs specialist handoff.")
+        self.assertEqual(escalated.data["case_state"]["status"], Case.Status.ESCALATED)
+        self.assertEqual(CaseActivity.objects.filter(case=case, action="CASE_ESCALATED").count(), 1)
+        self.assertEqual(CaseActivity.objects.filter(case=case, action="ESCALATION_HANDED_OFF").count(), 1)
+
+        case.assigned_clinician = clinician
+        case.save(update_fields=["assigned_clinician"])
+        finalized = self.client.post(url, {
+            "workflow_action": "finalize", "decision": "APPROVED",
+            "reviewer_comments": "Private final note", "patient_comments": "Your review is complete.",
+            "follow_up_instructions": "Follow up in one week.", "referral_details": "Cardiology clinic.",
+            "patient_request": "", "escalation_reason": "Needs specialist handoff.",
+        }, format="json")
+        self.assertEqual(finalized.status_code, status.HTTP_201_CREATED)
+        case.refresh_from_db()
+        review.refresh_from_db()
+        self.assertEqual(case.status, Case.Status.APPROVED)
+        self.assertEqual(review.decision, ClinicianReview.Decision.APPROVED)
+        self.assertTrue(review.is_finalized)
+        self.assertIsNotNone(review.approved_at)
+        self.assertEqual(finalized.data["case_state"]["status"], Case.Status.APPROVED)
+        self.assertTrue(CaseActivity.objects.filter(case=case, action="REVIEW_FINALIZED", new_status=Case.Status.APPROVED).exists())
+
+        self.client.force_authenticate(user=self.patient)
+        patient_final = self.client.get(patient_url)
+        self.assertEqual(patient_final.data["status"], "completed")
+        self.assertEqual(patient_final.data["review"]["decision"], Case.Status.APPROVED)
+        self.assertEqual(patient_final.data["review"]["patient_comments"], "Your review is complete.")
+        self.assertEqual(patient_final.data["review"]["follow_up_instructions"], "Follow up in one week.")
+        self.assertEqual(patient_final.data["review"]["referral_details"], "Cardiology clinic.")
+        self.assertNotIn("reviewer_comments", patient_final.data["review"])
+        self.assertNotIn("escalation_reason", patient_final.data["review"])
+
+        self.client.force_authenticate(user=clinician)
+        direct_case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Direct finalize", description="Ready for review")
+        direct_finalize = self.client.post(f"/api/cases/{direct_case.pk}/add_review/", {
+            "workflow_action": "finalize", "decision": "APPROVED", "patient_comments": "Reviewed directly.",
+        }, format="json")
+        self.assertEqual(direct_finalize.status_code, status.HTTP_201_CREATED, direct_finalize.data)
+        direct_case.refresh_from_db()
+        self.assertEqual(direct_case.status, Case.Status.APPROVED)
+
+    def test_review_write_rejects_unassigned_clinician_and_invalid_action_without_success(self):
+        clinician_group, _ = Group.objects.get_or_create(name="Clinician")
+        clinician = User.objects.create_user(username="wrong_review_clinician", password="test-password-123")
+        clinician.groups.add(clinician_group)
+        case = Case.objects.create(owner=self.patient, patient_name="Unauthorized", description="No assignment")
+        self.client.force_authenticate(user=clinician)
+        url = f"/api/cases/{case.pk}/add_review/"
+        unauthorized = self.client.post(url, {"workflow_action": "save_draft", "decision": "IN_REVIEW"}, format="json")
+        self.assertEqual(unauthorized.status_code, status.HTTP_403_FORBIDDEN)
+        assigned_case = Case.objects.create(owner=self.patient, assigned_clinician=clinician, patient_name="Invalid action", description="Assigned")
+        invalid = self.client.post(f"/api/cases/{assigned_case.pk}/add_review/", {"workflow_action": "not_a_workflow", "decision": "IN_REVIEW"}, format="json")
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("workflow_action", invalid.data)
+        self.assertFalse(ClinicianReview.objects.filter(case=assigned_case).exists())
+        self.assertFalse(CaseActivity.objects.filter(case=assigned_case).exists())
 
     def test_session_login_rejects_missing_csrf_token(self):
         client = Client(enforce_csrf_checks=True)
@@ -375,6 +560,16 @@ class CareFlowAPITests(APITestCase):
             HTTP_X_CSRFTOKEN=token,
         )
         self.assertEqual(accepted.status_code, 200)
+
+    def test_session_login_rejects_incorrect_credentials(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.post(
+            "/api/auth/login/",
+            {"username": "api_patient", "password": "incorrect-password"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "Invalid username or password.")
 
     @override_settings(CORS_ALLOWED_ORIGINS=["http://localhost:5173"])
     def test_vite_cors_preflight_allows_credentials(self):

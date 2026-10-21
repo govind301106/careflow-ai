@@ -315,14 +315,20 @@ class CaseViewSet(viewsets.ModelViewSet):
         new_status = request.data.get("status")
         if new_status not in Case.Status.values:
             raise ValidationError({"status": "Invalid status."})
+        if new_status == Case.Status.ESCALATED:
+            raise ValidationError({"status": "Use Escalate Case and record a handoff reason."})
+        if new_status == Case.Status.NEEDS_INFORMATION:
+            raise ValidationError({"status": "Use Request More Information so the patient receives the request."})
+        if new_status == Case.Status.APPROVED:
+            raise ValidationError({"status": "Use Finalize Review to complete a clinical review."})
 
         transitions = {
-            "NEEDS_REVIEW": ["IN_REVIEW", "NEEDS_INFORMATION", "ESCALATED"],
-            "PROCESSING": ["NEEDS_REVIEW", "NEEDS_INFORMATION", "ESCALATED"],
-            "IN_REVIEW": ["APPROVED", "NEEDS_INFORMATION", "ESCALATED"],
-            "NEEDS_INFORMATION": ["IN_REVIEW", "ESCALATED"],
-            "ESCALATED": ["IN_REVIEW"],
-            "APPROVED": [],
+            Case.Status.NEEDS_REVIEW: {Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED},
+            Case.Status.PROCESSING: {Case.Status.NEEDS_REVIEW, Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED},
+            Case.Status.IN_REVIEW: {Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED, Case.Status.APPROVED},
+            Case.Status.NEEDS_INFORMATION: {Case.Status.IN_REVIEW, Case.Status.ESCALATED},
+            Case.Status.ESCALATED: {Case.Status.IN_REVIEW},
+            Case.Status.APPROVED: set(),
         }
 
         if new_status not in transitions.get(case.status, []):
@@ -420,12 +426,16 @@ class CaseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated, IsClinician])
     def activities(self, request, pk=None):
         case = self.get_object()
+        if case.assigned_clinician_id != request.user.id:
+            raise PermissionDenied("Only the assigned clinician can view case activity.")
         activities = case.activities.select_related("actor").order_by("-timestamp")
         return Response(CaseActivitySerializer(activities, many=True).data)
 
     @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated, IsClinician])
     def ai_results(self, request, pk=None):
         case = self.get_object()
+        if case.assigned_clinician_id != request.user.id:
+            raise PermissionDenied("Only the assigned clinician can view AI results.")
         results = case.ai_results.order_by("-created_at")
         return Response(AIResultSerializer(results, many=True).data)
 
@@ -434,7 +444,12 @@ class CaseViewSet(viewsets.ModelViewSet):
         case = self.get_object()
 
         if request.method == "GET":
-            records = case.consent_records.filter(user=request.user).order_by("-created_at")
+            if is_clinician(request.user):
+                if case.assigned_clinician_id != request.user.id:
+                    raise PermissionDenied("Only the assigned clinician can view consent details.")
+                records = case.consent_records.order_by("-created_at")
+            else:
+                records = case.consent_records.filter(user=request.user).order_by("-created_at")
             return Response(ConsentRecordSerializer(records, many=True).data)
 
         if is_clinician(request.user):
@@ -462,6 +477,8 @@ class CaseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated, IsClinician])
     def reviews(self, request, pk=None):
         case = self.get_object()
+        if case.assigned_clinician_id != request.user.id:
+            raise PermissionDenied("Only the assigned clinician can view case reviews.")
         reviews = case.reviews.select_related("reviewer").order_by("-created_at")
         return Response(ClinicianReviewSerializer(reviews, many=True).data)
 
@@ -479,9 +496,15 @@ class CaseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         if not latest_review:
-            return Response({"status": "pending", "review": None})
+            return Response({"status": "in_progress", "request": None, "review": None})
         if not latest_review.is_finalized:
-            return Response({"status": "in_review", "review": None})
+            return Response({
+                "status": "in_progress",
+                "request": latest_review.patient_request or None
+                if latest_review.decision == Case.Status.NEEDS_INFORMATION
+                else None,
+                "review": None,
+            })
         return Response({"status": "completed", "review": PatientReviewSerializer(latest_review).data})
 
     @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated, HasValidRole], url_path="patient-ai-suggestions")
@@ -512,54 +535,92 @@ class CaseViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Assign the case to yourself before reviewing it.")
         serializer = ClinicianReviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        decision = serializer.validated_data["decision"]
-        is_finalized = decision != Case.Status.IN_REVIEW
+        action_name = request.data.get("workflow_action", "save_draft")
+        if action_name not in {"save_draft", "request_information", "escalate", "finalize"}:
+            raise ValidationError({"workflow_action": "Choose a supported review action."})
+        is_finalized = action_name == "finalize"
+        requested_status = {
+            "save_draft": Case.Status.IN_REVIEW,
+            "request_information": Case.Status.NEEDS_INFORMATION,
+            "escalate": Case.Status.ESCALATED,
+            "finalize": Case.Status.APPROVED,
+        }[action_name]
+        if action_name == "request_information" and not request.data.get("patient_request", "").strip():
+            raise ValidationError({"patient_request": "Enter the information request that the patient will see."})
+        if action_name == "escalate" and not request.data.get("escalation_reason", "").strip():
+            raise ValidationError({"escalation_reason": "Record a reason for escalating this case."})
         if is_finalized and not serializer.validated_data.get("patient_comments", "").strip():
             raise ValidationError({"patient_comments": "Patient-facing comments are required to finalize a review."})
+        if is_finalized and serializer.validated_data.get("decision") != ClinicianReview.Decision.APPROVED:
+            raise ValidationError({"decision": "Choose the supported completed review outcome before finalizing."})
+        if not is_finalized and serializer.validated_data.get("decision") == ClinicianReview.Decision.APPROVED:
+            raise ValidationError({"decision": "A completed review outcome can only be saved when finalizing."})
         ai_result = serializer.validated_data.get("ai_result")
         if ai_result and ai_result.case_id != case.pk:
             raise ValidationError({"ai_result": "The AI result must belong to this case."})
-        if decision not in [
-            Case.Status.IN_REVIEW,
-            Case.Status.NEEDS_INFORMATION,
-            Case.Status.ESCALATED,
-            Case.Status.APPROVED,
-        ]:
-            raise ValidationError({"decision": "Invalid review decision."})
-
-        allowed = {
-            "NEEDS_REVIEW": {"IN_REVIEW", "NEEDS_INFORMATION", "ESCALATED"},
-            "PROCESSING": {"NEEDS_REVIEW", "NEEDS_INFORMATION", "ESCALATED"},
-            "IN_REVIEW": {"APPROVED", "NEEDS_INFORMATION", "ESCALATED"},
-            "NEEDS_INFORMATION": {"IN_REVIEW", "ESCALATED"},
-            "ESCALATED": {"IN_REVIEW"}, "APPROVED": set(),
-        }
-        if decision not in allowed.get(case.status, set()):
-            raise ValidationError({"decision": f"Transition from {case.status} to {decision} is not allowed."})
+        if case.status == Case.Status.APPROVED:
+            raise ValidationError({"status": "A finalized case cannot be changed."})
+        if requested_status not in {
+            Case.Status.NEEDS_REVIEW: {Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED, Case.Status.APPROVED},
+            Case.Status.PROCESSING: {Case.Status.NEEDS_REVIEW, Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED, Case.Status.APPROVED},
+            Case.Status.IN_REVIEW: {Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED, Case.Status.APPROVED},
+            Case.Status.NEEDS_INFORMATION: {Case.Status.IN_REVIEW, Case.Status.NEEDS_INFORMATION, Case.Status.ESCALATED, Case.Status.APPROVED},
+            Case.Status.ESCALATED: {Case.Status.IN_REVIEW, Case.Status.ESCALATED, Case.Status.APPROVED},
+        }.get(case.status, set()):
+            raise ValidationError({"status": f"Transition from {case.status} to {requested_status} is not allowed."})
 
         with transaction.atomic():
-            review = serializer.save(
+            review = case.reviews.filter(is_finalized=False).order_by("-created_at").first()
+            values = serializer.validated_data.copy()
+            values.update(
+                decision=requested_status,
                 case=case,
                 reviewer=request.user,
                 is_finalized=is_finalized,
-                approved_at=timezone.now() if decision == Case.Status.APPROVED else None,
+                patient_request=request.data.get("patient_request", ""),
+                escalation_reason=request.data.get("escalation_reason", ""),
+                approved_at=timezone.now() if is_finalized else None,
             )
+            if review:
+                for field, value in values.items():
+                    setattr(review, field, value)
+                review.save()
+            else:
+                review = ClinicianReview.objects.create(**values)
             old_status = case.status
-            case.status = decision
-            case.save(update_fields=["status", "updated_at"])
-            CaseActivity.objects.create(
+            case.status = requested_status
+            update_fields = ["status", "updated_at"]
+            if action_name == "escalate":
+                # Return the escalated case to the unassigned queue so another
+                # clinician can claim the recorded handoff.
+                case.assigned_clinician = None
+                update_fields.append("assigned_clinician")
+            case.save(update_fields=update_fields)
+            activity_records = [CaseActivity.objects.create(
                 case=case,
                 actor=request.user,
-                action="CLINICIAN_REVIEW",
+                action={"save_draft": "REVIEW_DRAFT_SAVED", "request_information": "INFORMATION_REQUESTED", "escalate": "CASE_ESCALATED", "finalize": "REVIEW_FINALIZED"}[action_name],
                 old_status=old_status,
-                new_status=decision,
-            )
+                new_status=requested_status,
+            )]
+            if action_name == "escalate":
+                activity_records.append(CaseActivity.objects.create(
+                    case=case,
+                    actor=request.user,
+                    action="ESCALATION_HANDED_OFF",
+                    old_status=old_status,
+                    new_status=requested_status,
+                ))
 
-        return Response(
-            ClinicianReviewSerializer(review).data,
-            status=status.HTTP_201_CREATED,
-        )
+        response_data = ClinicianReviewSerializer(review).data
+        response_data["case_state"] = {
+            "id": case.pk,
+            "status": case.status,
+            "assigned_clinician": case.assigned_clinician_id,
+            "updated_at": case.updated_at,
+        }
+        response_data["case_activities"] = CaseActivitySerializer(activity_records, many=True).data
+        return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class AppointmentViewSet(viewsets.ModelViewSet):

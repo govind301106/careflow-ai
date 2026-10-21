@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiRequest, getCsrfToken } from "./api";
-import { createCaseRequestGate, getCaseDetailsForSelection } from "./caseRequestGate";
+import { applyReviewResponseToDetail, createCaseRequestGate, getCaseDetailsForSelection } from "./caseRequestGate";
+import { buildClinicianReviewPayload, validateClinicianReview } from "./clinicianReview";
 import "./App.css";
 
-const label = (value = "") => value.toLowerCase().replaceAll("_", " ");
+const label = (value = "") => value === "APPROVED" ? "Completed / Reviewed" : value.toLowerCase().replaceAll("_", " ");
 const navIcons = { Overview: "⌂", "New intake": "+", Cases: "▣", Appointments: "◷", "Intake chat": "◌", "Case queue": "▤", "Clinician approvals": "✓" };
 
 function App() {
@@ -134,7 +135,7 @@ function App() {
       const [intake, attachments, consent, activities, aiResults, clinicianReviews, patientAI] = await Promise.all([
         apiRequest(`/cases/${item.id}/intake/`).catch((error) => error.message === "No intake submitted yet." ? null : ({ unavailable: true, unavailableReason: error.message })),
         apiRequest(`/attachments/`).then((data) => (Array.isArray(data) ? data : data.results || []).filter((a) => a.case === item.id)),
-        user.role === "patient" ? apiRequest(`/cases/${item.id}/consent/`).catch(() => []) : Promise.resolve([]),
+        apiRequest(`/cases/${item.id}/consent/`).catch(() => []),
         user.role === "clinician" ? apiRequest(`/cases/${item.id}/activities/`).catch(() => []) : Promise.resolve([]),
         user.role === "clinician" ? apiRequest(`/cases/${item.id}/ai_results/`).catch(() => []) : Promise.resolve([]),
         user.role === "clinician" ? apiRequest(`/cases/${item.id}/reviews/`).catch(() => []) : Promise.resolve([]),
@@ -165,13 +166,39 @@ function App() {
 
   async function act(path, method, body = {}) {
     setBusy(true); setNotice("");
-    try { await apiRequest(path, { method, body: JSON.stringify(body) }); const freshCases = await refresh(); if (selected) { const fresh = freshCases.find((item) => item.id === selected.id) || selected; setSelected(fresh); await openCase(fresh); } setNotice("Changes saved."); }
-    catch (e) { setNotice(e.message); } finally { setBusy(false); }
+    try {
+      const response = await apiRequest(path, { method, body: JSON.stringify(body) });
+      const caseId = selected?.id;
+      const savedCase = response?.case_state;
+      const reviewSaved = Boolean(savedCase && response?.id && Array.isArray(response.case_activities));
+      if (savedCase && caseId === savedCase.id) {
+        setSelected((current) => current?.id === caseId ? { ...current, ...savedCase } : current);
+        setCases((current) => current.map((item) => item.id === caseId ? { ...item, ...savedCase } : item));
+        if (reviewSaved) {
+          setDetail((current) => applyReviewResponseToDetail(current, caseId, response));
+        }
+      }
+
+      let freshCases;
+      try {
+        freshCases = await refresh();
+      } catch (refreshError) {
+        if (!savedCase) throw refreshError;
+        setNotice(`Review saved. The case list could not be refreshed: ${refreshError.message}`);
+        return;
+      }
+      if (caseId) {
+        const fresh = freshCases.find((item) => item.id === caseId) || (savedCase ? { ...selected, ...savedCase } : selected);
+        setSelected(fresh);
+        if (!reviewSaved) await openCase(fresh);
+      }
+      setNotice("Changes saved.");
+    } catch (e) { setNotice(e.message); } finally { setBusy(false); }
   }
 
   async function download(attachment) {
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_URL || "http://127.0.0.1:8000/api"}/attachments/${attachment.id}/download/`, { credentials: "include" });
+      const response = await fetch(`/api/attachments/${attachment.id}/download/`, { credentials: "include" });
       if (!response.ok) throw new Error("Download is unavailable or unauthorized.");
       const url = URL.createObjectURL(await response.blob()); const anchor = document.createElement("a"); anchor.href = url; anchor.download = attachment.original_filename; anchor.click(); URL.revokeObjectURL(url);
     } catch (e) { setNotice(e.message); }
@@ -183,7 +210,6 @@ function App() {
 
   const clinician = user.role === "clinician";
   const selectedDetail = getCaseDetailsForSelection(detail, selected?.id);
-  const activeConsent = selectedDetail?.consent?.find((record) => record.granted && !record.withdrawn_at);
   const tabs = user.is_staff ? ["Clinician approvals"] : clinician ? ["Case queue", "Appointments"] : ["Overview", "New intake", "Cases", "Appointments", "Intake chat"];
   return <div className="app-shell"><aside className="sidebar"><a className="brand" href="#home" onClick={() => setTab(tabs[0])}><span className="brand-icon">✚</span><span>careflow<span className="brand-ai"> AI</span></span></a><div className="nav-label">{clinician ? "CLINICIAN WORKSPACE" : user.is_staff ? "ADMIN WORKSPACE" : "PATIENT PORTAL"}</div>{tabs.map((name) => <button key={name} className={`nav-item ${tab === name ? "active" : ""}`} onClick={() => { setTab(name); setSelected(null); setDetail(null); }}><span aria-hidden="true">{navIcons[name]}</span>{name}</button>)}<div className="sidebar-bottom"><div className="privacy-card"><strong>Human-led care</strong><p>AI output is advisory. Clinicians make final care decisions.</p></div><div className="profile"><div className="avatar">{(user.full_name || user.username).split(/\s+/).map((part) => part[0]).slice(0, 2).join("").toUpperCase()}</div><div className="profile-copy"><strong>{user.full_name || user.username}</strong><small>{user.email || user.username}</small><small>{user.role}</small></div><button className="text-btn signout-btn" onClick={signOut}>↪ Sign out</button></div></div></aside>
     <main className="main-content"><header className="topbar"><div className="breadcrumb">CareFlow <span>/</span> {tab}</div><span className="secure-label">Signed in as {user.username}</span></header><div className="page-content">{error && <div className="inline-notice">{error}</div>}{notice && <div className="inline-notice">{notice}</div>}
@@ -196,22 +222,22 @@ function App() {
       {selected && selectedDetail && <div className="case-detail-stack">
         <section className="panel case-detail-header">
           <div className="case-detail-title"><div className="eyebrow">CASE CF-{selected.id}</div><h1>{selected.patient_name}</h1><p>{selected.description || "No original patient description was saved."}</p></div>
-          <div className="case-detail-controls"><div className="case-state-badges"><Badge value={selected.status} /><Badge value={selected.priority} kind="priority" /></div>{clinician && <><span className="assignment-label">{selected.assigned_clinician ? (selected.assigned_clinician === user.id ? "Assigned to you" : `Assigned clinician #${selected.assigned_clinician}`) : "Unassigned"}</span>{!selected.assigned_clinician && <button className="secondary-btn" disabled={busy} onClick={() => act(`/cases/${selected.id}/assign/`, "PATCH", { clinician_id: user.id })}>Assign to me</button>}</>}{!clinician && <div className="consent-control"><Badge value={activeConsent ? "CONSENT_GRANTED" : selectedDetail.consent?.some((record) => record.withdrawn_at) ? "CONSENT_WITHDRAWN" : "CONSENT_NOT_RECORDED"} />{activeConsent && <button className="text-btn" onClick={() => act(`/consents/${activeConsent.id}/withdraw/`, "POST")}>Withdraw consent</button>}</div>}<button className="text-btn close-case" onClick={() => { setSelected(null); setDetail(null); }}>Close</button></div>
-          {clinician && selected.assigned_clinician === user.id && <label className="compact-status-control">Case workflow status<select aria-label="Update case status" value={selected.status} onChange={(e) => act(`/cases/${selected.id}/update_status/`, "PATCH", { status: e.target.value })}>{["NEEDS_REVIEW", "IN_REVIEW", "NEEDS_INFORMATION", "ESCALATED", "APPROVED"].map((s) => <option key={s} value={s}>{label(s)}</option>)}</select></label>}
+          <div className="case-detail-controls"><div className="case-state-badges"><Badge value={selected.status} /><Badge value={selected.priority} kind="priority" /></div>{clinician && <><span className="assignment-label">{selected.assigned_clinician ? (selected.assigned_clinician === user.id ? "Assigned to you" : `Assigned clinician #${selected.assigned_clinician}`) : "Unassigned"}</span>{!selected.assigned_clinician && <button className="secondary-btn" disabled={busy} onClick={() => act(`/cases/${selected.id}/assign/`, "PATCH", { clinician_id: user.id })}>Assign to me</button>}</>}<button className="text-btn close-case" onClick={() => { setSelected(null); setDetail(null); }}>Close</button></div>
+          {clinician && selected.assigned_clinician === user.id && selected.status !== "APPROVED" && <label className="compact-status-control">Case workflow status<select aria-label="Update case status" value={selected.status} onChange={(e) => act(`/cases/${selected.id}/update_status/`, "PATCH", { status: e.target.value })}>{["NEEDS_REVIEW", "IN_REVIEW", "NEEDS_INFORMATION", "ESCALATED"].map((s) => <option key={s} value={s}>{label(s)}</option>)}</select></label>}
         </section>
-        <CaseIntakeSection intake={selectedDetail.intake} description={selected.description} clinician={clinician} />
+        <CaseIntakeSection intake={selectedDetail.intake} description={selected.description} clinician={clinician} attachments={selectedDetail.attachments} onDownload={download} consent={selectedDetail.consent} onWithdraw={(record) => act(`/consents/${record.id}/withdraw/`, "POST")} />
         {clinician ? <AIResultsSection results={selectedDetail.aiResults} /> : <AIResultsSection patientAI={selectedDetail.patientAI} onRetry={() => openCase(selected)} />}
-        {clinician ? <ClinicianReviewSection reviews={selectedDetail.clinicianReviews} caseStatus={selected.status} selected={selected} user={user} busy={busy} act={act} /> : <PatientReviewPanel review={selectedDetail.patientReview} onRetry={retryPatientReview} />}
+        {clinician ? <ClinicianReviewSection reviews={selectedDetail.clinicianReviews} caseStatus={selected.status} selected={selected} user={user} busy={busy} act={act} onError={setNotice} /> : <PatientReviewPanel review={selectedDetail.patientReview} onRetry={retryPatientReview} />}
         {clinician && <section className="panel detail-section activity-section"><div className="detail-section-heading"><div><h3>Case activity</h3><p>Recorded workflow events for this case.</p></div></div>{selectedDetail.activities?.length ? <ol className="activity-timeline">{[...selectedDetail.activities].sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp)).map((activity) => <li key={activity.id}><time dateTime={activity.timestamp}>{new Date(activity.timestamp).toLocaleString()}</time><strong>{label(activity.action)}</strong>{activity.old_status && <span>{label(activity.old_status)} → {label(activity.new_status)}</span>}</li>)}</ol> : <p className="detail-empty">No case activity has been recorded.</p>}</section>}
-        {selectedDetail.attachments?.map((a) => <p className="attachment-row" key={a.id}>Private report: {a.original_filename} <button className="text-btn" onClick={() => download(a)}>Download</button></p>)}
       </div>}      {tab === "Appointments" && <AppointmentPanel appointments={appointments} clinician={clinician} refresh={refresh} />}
     </div></main></div>;
 }
 
 function Stat({ label: title, value }) { return <div className="stat-card"><div><p>{title}</p><strong>{value}</strong></div></div>; }
-function CaseIntakeSection({ intake, description, clinician }) {
+function CaseIntakeSection({ intake, description, clinician, attachments = [], onDownload, consent = [], onWithdraw }) {
   const original = intake?.original_answers && typeof intake.original_answers === "object" ? Object.entries(intake.original_answers).filter(([key]) => key !== "chat_messages") : [];
-  return <section className="panel detail-section intake-section"><div className="detail-section-heading"><div><h3>Patient intake</h3><p>Original patient information and structured intake, when available.</p></div></div>{intake?.unavailable ? <div className="intake-missing"><p className="detail-empty">{clinician && /assigned clinician/i.test(intake.unavailableReason || "") ? "Structured intake is available after this case is assigned to you." : "Structured intake could not be loaded."}</p><p><strong>Original patient-provided information</strong></p><p>{description || "No original patient description was saved."}</p></div> : intake ? <><div className="intake-grid"><p><strong>Symptoms</strong><span>{Array.isArray(intake.symptoms) ? intake.symptoms.join(", ") || "Not specified" : intake.symptoms || "Not specified"}</span></p><p><strong>Symptom onset</strong><span>{intake.symptom_onset || "Not provided"}</span></p><p><strong>Duration</strong><span>{intake.duration || "Not provided"}</span></p><p><strong>Severity</strong><span>{intake.severity_description || "Not provided"}</span></p><p><strong>Progression</strong><span>{intake.progression || "Not provided"}</span></p><p><strong>Medical history</strong><span>{intake.medical_history || "Not provided"}</span></p><p><strong>Medications</strong><span>{intake.current_medications || "Not provided"}</span></p><p><strong>Allergies</strong><span>{intake.allergies || "Not provided"}</span></p><p><strong>Additional information</strong><span>{intake.additional_information || "Not provided"}</span></p></div>{original.length > 0 && <details className="original-answers"><summary>Original responses</summary><dl>{original.map(([key, value]) => <div key={key}><dt>{label(key)}</dt><dd>{typeof value === "string" ? value : JSON.stringify(value)}</dd></div>)}</dl></details>}{clinician && intake.original_answers?.chat_messages?.length > 0 && <details className="original-answers"><summary>Patient chat source messages</summary><ol>{intake.original_answers.chat_messages.map((message, index) => <li key={index}>{message}</li>)}</ol></details>}</> : <div className="intake-missing"><p className="detail-empty">No structured intake was saved for this case.</p><p><strong>Original patient-provided information</strong></p><p>{description || "No original patient description was saved."}</p></div>}</section>;
+  const activeConsent = consent.find((record) => record.granted && !record.withdrawn_at);
+  return <section className="panel detail-section intake-section"><div className="detail-section-heading"><div><h3>Patient intake</h3><p>Original patient information and structured intake, when available.</p></div><div className="consent-control"><Badge value={activeConsent ? "CONSENT_GRANTED" : consent.some((record) => record.withdrawn_at) ? "CONSENT_WITHDRAWN" : "CONSENT_NOT_RECORDED"} />{!clinician && activeConsent && <button className="text-btn" onClick={() => onWithdraw?.(activeConsent)}>Withdraw consent</button>}</div></div>{intake?.unavailable ? <div className="intake-missing"><p className="detail-empty">{clinician && /assigned clinician/i.test(intake.unavailableReason || "") ? "Structured intake is available after this case is assigned to you." : "Structured intake could not be loaded."}</p><p><strong>Original patient-provided information</strong></p><p>{description || "No original patient description was saved."}</p></div> : intake ? <><div className="intake-grid"><p><strong>Symptoms</strong><span>{Array.isArray(intake.symptoms) ? intake.symptoms.join(", ") || "Not specified" : intake.symptoms || "Not specified"}</span></p><p><strong>Symptom onset</strong><span>{intake.symptom_onset || "Not provided"}</span></p><p><strong>Duration</strong><span>{intake.duration || "Not provided"}</span></p><p><strong>Severity</strong><span>{intake.severity_description || "Not provided"}</span></p><p><strong>Progression</strong><span>{intake.progression || "Not provided"}</span></p><p><strong>Medical history</strong><span>{intake.medical_history || "Not provided"}</span></p><p><strong>Medications</strong><span>{intake.current_medications || "Not provided"}</span></p><p><strong>Allergies</strong><span>{intake.allergies || "Not provided"}</span></p><p><strong>Additional information</strong><span>{intake.additional_information || "Not provided"}</span></p></div>{original.length > 0 && <details className="original-answers"><summary>Original responses</summary><dl>{original.map(([key, value]) => <div key={key}><dt>{label(key)}</dt><dd>{typeof value === "string" ? value : JSON.stringify(value)}</dd></div>)}</dl></details>}{clinician && intake.original_answers?.chat_messages?.length > 0 && <details className="original-answers"><summary>Patient chat source messages</summary><ol>{intake.original_answers.chat_messages.map((message, index) => <li key={index}>{message}</li>)}</ol></details>}</> : <div className="intake-missing"><p className="detail-empty">No structured intake was saved for this case.</p><p><strong>Original patient-provided information</strong></p><p>{description || "No original patient description was saved."}</p></div>}{attachments.map((attachment) => <p className="attachment-row" key={attachment.id}>Private report: {attachment.original_filename} <button className="text-btn" onClick={() => onDownload?.(attachment)}>Download</button></p>)}</section>;
 }
 
 const AI_DISPLAY_FIELDS = [
@@ -226,7 +252,8 @@ function displayValue(value) { return typeof value === "string" ? value : JSON.s
 function AIResultsSection({ results = [], patientAI, onRetry }) {
   const patientResult = patientAI?.status === "completed" ? patientAI.result : null;
   const entries = patientResult ? AI_DISPLAY_FIELDS.filter(([key]) => Object.hasOwn(patientResult.suggestions || {}, key)).map(([key, title]) => [title, patientResult.suggestions[key]]) : [];
-  return <section className="panel detail-section ai-analysis-section"><div className="detail-section-heading"><div><h3>AI Suggestions</h3><p>Advisory analysis only. It does not make or replace a clinician decision.</p></div><span className="workflow-label">{patientAI ? patientAI.status.replaceAll("_", " ") : results.length ? "saved results" : "not configured"}</span></div>{patientAI ? <>
+  const aiStatusLabel = ({ not_configured: "Not configured", not_started: "Not submitted", in_progress: "In Progress", completed: "Completed", failed: "Failed", unavailable: "Unavailable" })[patientAI?.status] || (results.length ? "Saved results" : "Not configured");
+  return <section className="panel detail-section ai-analysis-section"><div className="detail-section-heading"><div><h3>AI Suggestions</h3><p>Advisory analysis only. It does not make or replace a clinician decision.</p></div><span className="workflow-label">{aiStatusLabel}</span></div>{patientAI ? <>
     {patientAI.status === "not_configured" && <p className="detail-empty">AI analysis is not configured. Your clinician review can proceed independently.</p>}
     {patientAI.status === "not_started" && <p className="detail-empty">AI analysis is configured but has not been submitted for this case. Your clinician review can proceed independently.</p>}
     {patientAI.status === "in_progress" && <p className="detail-empty"><Badge value="PROCESSING" /> AI analysis is in progress. Suggestions will appear here when a validated result is saved.</p>}
@@ -237,21 +264,51 @@ function AIResultsSection({ results = [], patientAI, onRetry }) {
   </> : results.length ? results.map((result) => <article className="ai-result" key={result.id}><div className="ai-result-heading"><Badge value={result.status} /><span>{result.model_name || "AI analysis"}{result.schema_version ? ` · Schema ${result.schema_version}` : ""}</span><time dateTime={result.created_at}>{new Date(result.created_at).toLocaleDateString()}</time></div>{result.status === "COMPLETED" ? result.is_validated ? <><h4>Persisted structured suggestions</h4><pre>{JSON.stringify(result.structured_output, null, 2)}</pre>{result.uncertainty_flags?.length > 0 && <p><strong>Uncertainty flags:</strong> {displayValue(result.uncertainty_flags)}</p>}{result.rule_triggers?.length > 0 && <p><strong>Rule triggers:</strong> {displayValue(result.rule_triggers)}</p>}{result.evidence?.length > 0 && <p><strong>Evidence references:</strong> {displayValue(result.evidence)}</p>}</> : <p className="detail-empty">Saved output has not passed validation. Do not use it as a clinical suggestion.</p> : <p className="detail-empty">{result.status === "FAILED" ? "AI analysis failed. No suggestions are available." : "AI analysis is in progress. No suggestions are available yet."}</p>}</article>) : <p className="detail-empty">AI pipeline is not configured and no AI result has been saved. This state is independent of the case workflow status.</p>}</section>;
 }
 
-function ClinicianReviewSection({ reviews = [], caseStatus, selected, user, busy, act }) {
+function ClinicianReviewSection({ reviews = [], caseStatus, selected, user, busy, act, onError }) {
   const review = [...reviews].sort((left, right) => new Date(right.created_at) - new Date(left.created_at))[0];
   const canReview = selected.status !== "APPROVED" && selected.assigned_clinician === user.id;
-  return <section className="panel detail-section clinician-review-section"><div className="detail-section-heading"><div><h3>Clinical review</h3><p>Clinician-authored decision, separate from AI suggestions.</p></div><Badge value={review?.is_finalized ? review.decision : (review?.decision === "IN_REVIEW" || caseStatus === "IN_REVIEW" ? "IN_REVIEW" : "NEEDS_REVIEW")} /></div>{!review ? <p className="detail-empty">{caseStatus === "IN_REVIEW" ? "Case workflow is in review; no review record has been saved yet." : "No clinician review has been saved for this case."}</p> : <><p className="review-saved-state">{review.is_finalized ? "Finalized clinician decision" : "Draft review in progress"}</p>{review.is_finalized && <p><strong>Decision:</strong> {label(review.decision)}</p>}{review.patient_comments && <p><strong>Patient-facing comments:</strong> {review.patient_comments}</p>}{review.reviewer_comments && <p><strong>Internal clinician notes:</strong> {review.reviewer_comments}</p>}{review.edited_note && <p><strong>Clinician working note:</strong> {review.edited_note}</p>}{review.follow_up_instructions && <p><strong>Follow-up instructions:</strong> {review.follow_up_instructions}</p>}{review.referral_details && <p><strong>Referral details:</strong> {review.referral_details}</p>}<small className="review-date">Saved {new Date(review.created_at).toLocaleString()}</small></>}{selected.status === "APPROVED" && <p className="detail-empty">This case is approved and cannot be reviewed again.</p>}{!canReview && selected.status !== "APPROVED" && <p className="detail-empty">Assign this case to yourself before saving a clinician review.</p>}{canReview && <form className="clinician-review-form" onSubmit={(e) => { e.preventDefault(); const data = new FormData(e.currentTarget); act(`/cases/${selected.id}/add_review/`, "POST", { decision: data.get("decision"), reviewer_comments: data.get("comments"), patient_comments: data.get("patient_comments"), follow_up_instructions: data.get("follow_up"), referral_details: data.get("referral") }); }}><label>Review decision<select name="decision" defaultValue={review?.is_finalized ? "IN_REVIEW" : review?.decision || "IN_REVIEW"}><option value="IN_REVIEW">Draft / in progress</option><option value="NEEDS_INFORMATION">Needs information</option><option value="ESCALATED">Escalated</option><option value="APPROVED">Approved</option></select></label><label>Internal clinician notes<textarea name="comments" rows={2} defaultValue={review?.reviewer_comments || ""} /></label><label>Comments for patient<textarea name="patient_comments" rows={2} defaultValue={review?.is_finalized ? "" : review?.patient_comments || ""} /></label><div className="two-columns"><label>Follow-up instructions<textarea name="follow_up" rows={2} defaultValue={review?.follow_up_instructions || ""} /></label><label>Referral details<textarea name="referral" rows={2} defaultValue={review?.referral_details || ""} /></label></div><button className="primary-btn" disabled={busy}>Save review</button></form>}</section>;
+  const submitAction = (form, workflowAction) => {
+    const data = new FormData(form);
+    const validationError = validateClinicianReview(data, workflowAction);
+    if (validationError) {
+      onError(validationError);
+      return;
+    }
+    if (workflowAction === "finalize" && !window.confirm("Finalize this clinical review and publish the patient-facing information?")) return;
+    act(`/cases/${selected.id}/add_review/`, "POST", buildClinicianReviewPayload(data, workflowAction));
+  };
+  return <section className="panel detail-section clinician-review-section"><div className="detail-section-heading"><div><h3>Clinician Review</h3><p>Clinical review status is separate from case priority, consent, and AI processing.</p></div><Badge value={review?.is_finalized ? "APPROVED" : review?.decision === "NEEDS_INFORMATION" ? "NEEDS_INFORMATION" : review?.decision === "ESCALATED" ? "ESCALATED" : caseStatus === "IN_REVIEW" ? "IN_REVIEW" : "NEEDS_REVIEW"} /></div>
+    {review && <><p className="review-saved-state">{review.is_finalized ? "Finalized clinical review" : "Unfinished review draft"}</p>{review.is_finalized && <p><strong>Outcome:</strong> {label(review.decision)}</p>}{!review.is_finalized && review.patient_request && <p><strong>Patient information request:</strong> {review.patient_request}</p>}{review.is_finalized && review.patient_comments && <p><strong>Patient-facing comments:</strong> {review.patient_comments}</p>}{review.is_finalized && review.follow_up_instructions && <p><strong>Follow-up instructions:</strong> {review.follow_up_instructions}</p>}{review.is_finalized && review.referral_details && <p><strong>Referral details:</strong> {review.referral_details}</p>}{review.escalation_reason && <p><strong>Escalation handoff reason:</strong> {review.escalation_reason}</p>}{review.reviewer_comments && <p><strong>Internal clinician notes:</strong> {review.reviewer_comments}</p>}<small className="review-date">Saved {new Date(review.approved_at || review.created_at).toLocaleString()}</small></>}
+    {!review && <p className="detail-empty">{caseStatus === "IN_REVIEW" ? "Case workflow is in review; no review record has been saved yet." : "No clinician review has been saved for this case."}</p>}
+    {selected.status === "APPROVED" && <p className="detail-empty">This clinical review is finalized and cannot be changed.</p>}
+    {!canReview && selected.status !== "APPROVED" && <p className="detail-empty">Assign this case to yourself before editing the clinician review.</p>}
+    {canReview && <form className="clinician-review-form" onSubmit={(event) => { event.preventDefault(); submitAction(event.currentTarget, "save_draft"); }}>
+      <section className="review-group review-outcome-group"><h4>Review outcome</h4><label className="review-outcome-field"><span>Decision</span><select name="decision" defaultValue="IN_REVIEW"><option value="IN_REVIEW">In progress (unfinished)</option><option value="APPROVED">Completed / Reviewed</option></select></label></section>
+      <section className="review-group"><h4>Clinical notes and patient communication</h4><div className="review-notes-grid">
+        <label><span>Internal clinician notes</span><small className="review-private-note">Private to authorized clinicians; never shown to patients.</small><textarea name="comments" rows={4} defaultValue={review?.reviewer_comments || ""} /></label>
+        <label><span>Comments for patient</span><textarea name="patient_comments" rows={4} defaultValue={review?.is_finalized ? "" : review?.patient_comments || ""} /></label>
+      </div></section>
+      <section className="review-group"><h4>Care plan</h4><div className="review-care-fields">
+        <label>Follow-up instructions<textarea name="follow_up" rows={4} defaultValue={review?.follow_up_instructions || ""} /></label>
+        <label>Referral details<textarea name="referral" rows={4} defaultValue={review?.referral_details || ""} /></label>
+      </div></section>
+      <section className="review-group"><h4>Additional actions</h4><div className="review-care-fields">
+        <label>Request more information<textarea name="patient_request" rows={3} defaultValue={review?.patient_request || ""} placeholder="Write the specific question or information needed from the patient." /></label>
+        <label>Escalation handoff reason<textarea name="escalation_reason" rows={3} defaultValue={review?.escalation_reason || ""} placeholder="Explain why another clinician or service should review this case." /></label>
+      </div></section>
+      <div className="review-actions"><button className="secondary-btn" disabled={busy} type="submit">Save Draft</button><button className="secondary-btn" disabled={busy} type="button" onClick={(event) => submitAction(event.currentTarget.form, "request_information")}>Request More Information</button><button className="secondary-btn" disabled={busy} type="button" onClick={(event) => submitAction(event.currentTarget.form, "escalate")}>Escalate Case</button><button className="primary-btn" disabled={busy} type="button" onClick={(event) => submitAction(event.currentTarget.form, "finalize")}>Finalize Review</button></div>
+    </form>}</section>;
 }
 function PatientReviewPanel({ review, onRetry }) {
   const saved = review?.status === "completed" ? review.review : null;
-  const status = saved ? saved.decision : review?.status === "in_review" ? "IN_REVIEW" : review?.status === "error" || review?.status === "loading" ? "UNKNOWN" : "NEEDS_REVIEW";
+  const status = saved ? "APPROVED" : review?.status === "in_progress" || review?.status === "in_review" ? "IN_REVIEW" : review?.status === "error" || review?.status === "loading" ? "UNKNOWN" : "NEEDS_REVIEW";
   return <section className="panel detail-section patient-review-section" aria-live="polite">
     <div className="detail-section-heading"><div><h3>Clinical Review</h3><p>Finalized clinician decision and patient-visible instructions.</p></div><Badge value={status} /></div>
-    {review?.status === "pending" && <p className="detail-empty" role="status">Awaiting clinician review.</p>}
-    {review?.status === "in_review" && <p className="detail-empty" role="status">In review. The clinician has not finalized a decision.</p>}
+    {(review?.status === "pending" || review?.status === "in_progress") && <p className="detail-empty" role="status">Clinical review is In Progress. The clinician has not finalized a decision.</p>}
+    {review?.request && <p className="patient-request" role="status"><strong>Requested information</strong><span>{review.request}</span></p>}
     {review?.status === "loading" && <p className="detail-empty" role="status">Checking clinical review status…</p>}
     {(review?.status === "error" || !review) && <div className="review-error" role="alert"><p>Clinical review status is temporarily unavailable.</p><button className="text-btn" type="button" onClick={onRetry}>Retry</button></div>}
-    {saved && <><p className="review-saved-state"><strong>Final clinician decision:</strong> {label(saved.decision)}</p>{saved.patient_comments && <p><strong>Clinician comments</strong><span>{saved.patient_comments}</span></p>}{saved.follow_up_instructions && <p><strong>Follow-up instructions</strong><span>{saved.follow_up_instructions}</span></p>}{saved.referral_details && <p><strong>Referral details</strong><span>{saved.referral_details}</span></p>}{saved.created_at && <small className="review-date">Reviewed {new Date(saved.created_at).toLocaleDateString()}</small>}</>}
+    {saved && <><p className="review-saved-state"><strong>Final clinician decision:</strong> {label(saved.decision)}</p>{saved.patient_comments && <p><strong>Clinician comments</strong><span>{saved.patient_comments}</span></p>}{saved.follow_up_instructions && <p><strong>Follow-up instructions</strong><span>{saved.follow_up_instructions}</span></p>}{saved.referral_details && <p><strong>Referral details</strong><span>{saved.referral_details}</span></p>}{(saved.approved_at || saved.created_at) && <small className="review-date">Reviewed {new Date(saved.approved_at || saved.created_at).toLocaleDateString()}</small>}</>}
   </section>;
 }
 function Badge({ value, kind = "status" }) {

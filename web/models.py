@@ -21,7 +21,7 @@ class Case(models.Model):
         NEEDS_REVIEW = "NEEDS_REVIEW", "Needs review"
         PROCESSING = "PROCESSING", "Processing"
         IN_REVIEW = "IN_REVIEW", "In review"
-        APPROVED = "APPROVED", "Approved"
+        APPROVED = "APPROVED", "Completed / Reviewed"
         NEEDS_INFORMATION = "NEEDS_INFORMATION", "Needs information"
         ESCALATED = "ESCALATED", "Escalated"
 
@@ -205,7 +205,7 @@ class ClinicianReview(models.Model):
         IN_REVIEW = "IN_REVIEW", "In review"
         NEEDS_INFORMATION = "NEEDS_INFORMATION", "Needs information"
         ESCALATED = "ESCALATED", "Escalated"
-        APPROVED = "APPROVED", "Approved"
+        APPROVED = "APPROVED", "Completed / Reviewed"
 
     case = models.ForeignKey(
         Case, on_delete=models.PROTECT, related_name="reviews"
@@ -228,6 +228,8 @@ class ClinicianReview(models.Model):
     patient_comments = models.TextField(blank=True)
     follow_up_instructions = models.TextField(blank=True)
     referral_details = models.TextField(blank=True)
+    patient_request = models.TextField(blank=True)
+    escalation_reason = models.TextField(blank=True)
     is_finalized = models.BooleanField(default=False)
     approved_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

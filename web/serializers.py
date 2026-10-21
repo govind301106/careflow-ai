@@ -109,6 +109,7 @@ class ClinicianReviewSerializer(serializers.ModelSerializer):
             "id", "case", "reviewer", "ai_result", "decision",
             "edited_note", "reviewer_comments", "approved_at",
             "patient_comments", "follow_up_instructions", "referral_details",
+            "patient_request", "escalation_reason",
             "is_finalized", "created_at",
         ]
         read_only_fields = ["id", "case", "reviewer", "approved_at", "created_at"]
@@ -117,7 +118,7 @@ class ClinicianReviewSerializer(serializers.ModelSerializer):
 class PatientReviewSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClinicianReview
-        fields = ["decision", "patient_comments", "follow_up_instructions", "referral_details", "created_at"]
+        fields = ["decision", "patient_comments", "follow_up_instructions", "referral_details", "created_at", "approved_at"]
         read_only_fields = fields
 
 
