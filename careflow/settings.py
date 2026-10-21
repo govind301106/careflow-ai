@@ -42,14 +42,6 @@ if not SECRET_KEY:
     raise ValueError("DJANGO_SECRET_KEY is missing from the environment")
 
 
-if os.getenv("DATABASE_URL"):
-    DATABASES = {
-        "default": dj_database_url.parse(
-            os.environ["DATABASE_URL"],
-            conn_max_age=60,
-            conn_health_checks=True,
-        )
-    }
 # Application definition
 
 INSTALLED_APPS = [
@@ -100,12 +92,11 @@ WSGI_APPLICATION = "careflow.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
-}
+DATABASES = (
+    {"default": dj_database_url.parse(os.environ["DATABASE_URL"], conn_max_age=60, conn_health_checks=True)}
+    if os.getenv("DATABASE_URL")
+    else {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
+)
 
 
 # Password validation
@@ -157,9 +148,15 @@ MAILERS = {
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
-        "rest_framework.authentication.BasicAuthentication",
     ],
 }
+
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = False
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+# Leave room for multipart headers around the endpoint's 10 MB file limit.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 11 * 1024 * 1024
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()

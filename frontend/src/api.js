@@ -4,7 +4,7 @@ const API_URL =
 
 
 
-async function getCsrfToken() {
+export async function getCsrfToken() {
     const response = await fetch(`${API_URL}/csrf/`, {
         credentials: "include",
     });
@@ -54,9 +54,10 @@ export async function apiRequest(endpoint, options = {}) {
     const data = await response.json().catch(() => null);
 
     if (!response.ok) {
-        throw new Error(
-            data?.detail || JSON.stringify(data) || `Request failed: ${response.status}`
-        );
+        const message = data?.detail || (data && typeof data === "object"
+            ? Object.entries(data).map(([field, errors]) => `${field}: ${Array.isArray(errors) ? errors.join(" ") : errors}`).join("; ")
+            : "");
+        throw new Error(message || `Request failed: ${response.status}`);
     }
 
     return data;

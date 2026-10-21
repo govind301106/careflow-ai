@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from django.http import FileResponse
+from django.utils.http import content_disposition_header
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -40,6 +41,6 @@ class AttachmentDownloadView(APIView):
             content_type="application/octet-stream",
         )
         filename = Path(attachment.original_filename).name
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["Content-Disposition"] = content_disposition_header(True, filename)
         response["X-Content-Type-Options"] = "nosniff"
         return response

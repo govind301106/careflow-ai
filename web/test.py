@@ -106,6 +106,8 @@ class CaseSecurityTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_clinician_can_update_status_and_activity_is_logged(self):
+        self.case1.assigned_clinician = self.clinician
+        self.case1.save(update_fields=["assigned_clinician"])
         self.client.force_authenticate(user=self.clinician)
 
         response = self.client.patch(
@@ -159,6 +161,8 @@ class CaseSecurityTests(APITestCase):
             ).exists()
         )
     def test_invalid_status_transition_is_rejected(self):
+        self.case1.assigned_clinician = self.clinician
+        self.case1.save(update_fields=["assigned_clinician"])
         self.client.force_authenticate(user=self.clinician)
 
         response = self.client.patch(

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from django.utils import timezone
 from .models import CaseAttachment
 from django.core.files.storage import FileSystemStorage
+from tempfile import TemporaryDirectory
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -195,3 +196,34 @@ class MedicalReportSecurityTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         mock_store.assert_not_called()
+
+    def test_private_file_upload_and_authorized_download_round_trip(self):
+        from web.storage import private_storage
+
+        self.client.force_authenticate(user=self.patient)
+        self.grant_consent()
+        content = b"%PDF-1.4 private test report"
+
+        with TemporaryDirectory() as upload_root:
+            with patch.object(private_storage, "_location", upload_root):
+                upload = SimpleUploadedFile(
+                    "private-report.pdf", content, content_type="application/pdf"
+                )
+                uploaded = self.client.post(
+                    f"/api/cases/{self.case.pk}/attachments/",
+                    {"file": upload},
+                    format="multipart",
+                )
+                self.assertEqual(uploaded.status_code, status.HTTP_201_CREATED)
+
+                downloaded = self.client.get(
+                    f"/api/attachments/{uploaded.data['id']}/download/"
+                )
+                self.assertEqual(downloaded.status_code, status.HTTP_200_OK)
+                self.assertEqual(b"".join(downloaded.streaming_content), content)
+
+                self.client.force_authenticate(user=self.other_patient)
+                denied = self.client.get(
+                    f"/api/attachments/{uploaded.data['id']}/download/"
+                )
+                self.assertEqual(denied.status_code, status.HTTP_404_NOT_FOUND)

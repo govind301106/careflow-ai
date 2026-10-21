@@ -3,6 +3,19 @@ from django.db import models
 from django.conf import settings
 
 
+class ClinicianRegistration(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending approval"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="clinician_registration")
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="clinician_requests_reviewed")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class Case(models.Model):
     class Status(models.TextChoices):
         NEEDS_REVIEW = "NEEDS_REVIEW", "Needs review"
@@ -72,6 +85,15 @@ class PatientIntake(models.Model):
     contradiction_flags = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class IntakeChatMessage(models.Model):
+    """Verbatim patient source messages and labelled deterministic prompts."""
+    case = models.ForeignKey(Case, on_delete=models.CASCADE, related_name="chat_messages")
+    role = models.CharField(max_length=12, choices=(("patient", "Patient"), ("assistant", "Assistant")))
+    content = models.TextField()
+    assistant_mode = models.CharField(max_length=30, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Appointment(models.Model):
@@ -172,6 +194,9 @@ class AIResult(models.Model):
     uncertainty_flags = models.JSONField(default=list, blank=True)
     rule_triggers = models.JSONField(default=list, blank=True)
     error_code = models.CharField(max_length=100, blank=True)
+    # True only after the saved payload passed the agreed pipeline schema and
+    # patient-safety validation. Existing rows remain unavailable by default.
+    is_validated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
 
@@ -200,6 +225,10 @@ class ClinicianReview(models.Model):
     decision = models.CharField(max_length=30, choices=Decision.choices)
     edited_note = models.TextField(blank=True)
     reviewer_comments = models.TextField(blank=True)
+    patient_comments = models.TextField(blank=True)
+    follow_up_instructions = models.TextField(blank=True)
+    referral_details = models.TextField(blank=True)
+    is_finalized = models.BooleanField(default=False)
     approved_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -5,10 +5,11 @@ class IsClinician(BasePermission):
     message = "Only clinicians can perform this action."
 
     def has_permission(self, request, view):
-        return (
-            request.user.is_authenticated
-            and request.user.groups.filter(name="Clinician").exists()
-        )
+        user = request.user
+        if not user.is_authenticated or not user.groups.filter(name="Clinician").exists():
+            return False
+        request_record = getattr(user, "clinician_registration", None)
+        return request_record is None or request_record.status == "APPROVED"
 
 
 class HasValidRole(BasePermission):
@@ -17,12 +18,14 @@ class HasValidRole(BasePermission):
     def has_permission(self, request, view):
         user = request.user
 
-        return (
-            user.is_authenticated
-            and user.groups.filter(
-                name__in=["Patient", "Clinician"]
-            ).exists()
-        )
+        if not user.is_authenticated:
+            return False
+        if user.groups.filter(name="Patient").exists():
+            return True
+        if not user.groups.filter(name="Clinician").exists():
+            return False
+        request_record = getattr(user, "clinician_registration", None)
+        return request_record is None or request_record.status == "APPROVED"
     from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
